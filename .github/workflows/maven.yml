@@ -1,25 +1,33 @@
-# This workflow automatically tests new commits and pull requests as they come in.
-# Note that this does not upload any artifacts, you will need to compile mcMMO manually
-# if you wish to create the actual jar.
+# This workflow builds and tests mcMMO, uploads the compiled plugin as a build
+# artifact and publishes it as a single, rolling pre-release.
 name: Compile and test
 
 on:
-  # We run our tests whenever the pom or a source file was touched.
-  # There is no need to run Maven when only the changelog was touched.
-  # We may also want to re-run this workflow when the workflow file itself
-  # was updated too.
+  # Only the master branch triggers a build. Pull request runs are intentionally
+  # not configured: every build in this repository targets master.
   push:
+    branches:
+      - master
     paths:
     - 'src/**'
     - 'pom.xml'
     - '.github/workflows/maven.yml'
 
-  # Whenever someone submits a new pull request which modified the pom or a source file,
-  # we want to ensure it compiles successfully and that all tests will pass.
-  pull_request:
-    paths:
-    - 'src/**'
-    - 'pom.xml'
+# Needed to create the pre-release and to delete previous ones (release + tag).
+permissions:
+  contents: write
+
+# Serialize builds instead of cancelling them, so a run is never interrupted
+# halfway through publishing or cleaning up releases.
+concurrency:
+  group: maven-master
+  cancel-in-progress: false
+
+env:
+  # Pre-release tags are "${PRERELEASE_TAG}-<short sha>". Every build publishes
+  # its own tag first and then deletes all other pre-releases with their tags,
+  # so exactly one pre-release remains.
+  PRERELEASE_TAG: dev-build
 
 jobs:
   compile:
@@ -47,6 +55,83 @@ jobs:
         key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
         restore-keys: ${{ runner.os }}-m2
 
-    # 4. Build via Maven 
+    # 4. Build via Maven
     - name: Build via Maven
       run: mvn verify -B -Psql-tests --file pom.xml -DdisableXmlReport=true
+
+    # 5. Read the project version and the short commit hash
+    - name: Resolve build metadata
+      id: meta
+      run: |
+        VERSION=$(sed -n 's:.*<version>\(.*\)</version>.*:\1:p' pom.xml | head -n 1)
+        # File names should not carry the -SNAPSHOT qualifier of dev builds.
+        VERSION_CLEAN=${VERSION%-SNAPSHOT}
+        SHORT_SHA=${GITHUB_SHA::7}
+        SUBJECT=$(git log -1 --pretty=%s)
+        {
+          echo "version=${VERSION}"
+          echo "version_clean=${VERSION_CLEAN}"
+          echo "short_sha=${SHORT_SHA}"
+          echo "commit_subject=${SUBJECT}"
+        } >> "$GITHUB_OUTPUT"
+        echo "Version: ${VERSION}, commit: ${SHORT_SHA}, subject: ${SUBJECT}"
+
+    # 6. Attach the compiled plugin to this workflow run (Actions > run > Artifacts)
+    - name: Upload plugin jar
+      uses: actions/upload-artifact@v4
+      with:
+        name: mcMMO-${{ steps.meta.outputs.version_clean }}-${{ steps.meta.outputs.short_sha }}
+        path: target/mcMMO.jar
+        if-no-files-found: error
+        retention-days: 90
+
+    # 7. Publish the freshly built jar as a pre-release. The tag carries the
+    #    commit hash so re-runs of the same commit are idempotent.
+    - name: Publish pre-release
+      id: release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        VERSION: ${{ steps.meta.outputs.version_clean }}
+        SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
+        COMMIT_SUBJECT: ${{ steps.meta.outputs.commit_subject }}
+      run: |
+        TAG="${PRERELEASE_TAG}-${SHORT_SHA}"
+        echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+        # A re-run of the same commit owns the same tag: drop it first.
+        gh release delete "${TAG}" --yes --cleanup-tag || true
+
+        cat > release-notes.md <<EOF
+        Automated development build of \`master\`.
+
+        - Version: \`${VERSION}\`
+        - Commit: [\`${SHORT_SHA}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})
+        - Message: ${COMMIT_SUBJECT}
+        - Build: [run #${GITHUB_RUN_NUMBER}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})
+
+        Only the latest pre-release is kept: older pre-releases and their tags are
+        deleted automatically on every build. Drop \`mcMMO-${VERSION}.jar\` into your
+        server's \`plugins/\` folder.
+        EOF
+
+        gh release create "${TAG}" \
+          "target/mcMMO.jar#mcMMO-${VERSION}.jar" \
+          --prerelease \
+          --target "${GITHUB_SHA}" \
+          --title "Dev build ${VERSION} (${SHORT_SHA})" \
+          --notes-file release-notes.md
+
+    # 8. Wipe every historical pre-release, releases and tags alike, so the one
+    #    published above stays the only pre-release in the repository.
+    - name: Delete previous pre-releases
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        KEEP_TAG: ${{ steps.release.outputs.tag }}
+      run: |
+        gh release list --limit 100 --json tagName,isPrerelease \
+          --jq '.[] | select(.isPrerelease) | .tagName' | while read -r tag; do
+            [ -z "${tag}" ] && continue
+            [ "${tag}" = "${KEEP_TAG}" ] && continue
+            echo "Deleting pre-release ${tag} (release and tag)"
+            gh release delete "${tag}" --yes --cleanup-tag
+          done
