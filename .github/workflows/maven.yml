@@ -13,6 +13,11 @@ on:
     - 'pom.xml'
     - '.github/workflows/maven.yml'
 
+  # Manual trigger from the Actions tab (Actions > Compile and test > Run workflow).
+  # The path filter above does not apply here, so a run can be started on demand,
+  # for example to verify the workflow itself without touching any source file.
+  workflow_dispatch:
+
 # Needed to create the pre-release and to delete previous ones (release + tag).
 permissions:
   contents: write
